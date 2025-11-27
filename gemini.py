@@ -14,6 +14,7 @@ import threading
 import os
 import re
 import shutil
+import mimetypes
 import requests
 from pathlib import Path
 from datetime import datetime
@@ -39,6 +40,7 @@ BASE_URL = "https://biz-discoveryengine.googleapis.com/v1alpha/locations/global"
 CREATE_SESSION_URL = f"{BASE_URL}/widgetCreateSession"
 STREAM_ASSIST_URL = f"{BASE_URL}/widgetStreamAssist"
 LIST_FILE_METADATA_URL = f"{BASE_URL}/widgetListSessionFileMetadata"
+ADD_CONTEXT_FILE_URL = f"{BASE_URL}/widgetAddContextFile"
 GETOXSRF_URL = "https://business.gemini.google/auth/getoxsrf"
 
 # Flask应用
@@ -117,6 +119,59 @@ class AccountManager:
 
 # 全局账号管理器
 account_manager = AccountManager()
+
+
+class FileManager:
+    """文件管理器 - 管理上传文件的映射关系（OpenAI file_id <-> Gemini fileId）"""
+    
+    def __init__(self):
+        self.files: Dict[str, Dict] = {}  # openai_file_id -> {gemini_file_id, session_name, filename, mime_type, size, created_at}
+    
+    def add_file(self, openai_file_id: str, gemini_file_id: str, session_name: str, 
+                 filename: str, mime_type: str, size: int) -> Dict:
+        """添加文件映射"""
+        file_info = {
+            "id": openai_file_id,
+            "gemini_file_id": gemini_file_id,
+            "session_name": session_name,
+            "filename": filename,
+            "mime_type": mime_type,
+            "bytes": size,
+            "created_at": int(time.time()),
+            "purpose": "assistants",
+            "object": "file"
+        }
+        self.files[openai_file_id] = file_info
+        return file_info
+    
+    def get_file(self, openai_file_id: str) -> Optional[Dict]:
+        """获取文件信息"""
+        return self.files.get(openai_file_id)
+    
+    def get_gemini_file_id(self, openai_file_id: str) -> Optional[str]:
+        """获取 Gemini 文件ID"""
+        file_info = self.files.get(openai_file_id)
+        return file_info.get("gemini_file_id") if file_info else None
+    
+    def delete_file(self, openai_file_id: str) -> bool:
+        """删除文件映射"""
+        if openai_file_id in self.files:
+            del self.files[openai_file_id]
+            return True
+        return False
+    
+    def list_files(self) -> List[Dict]:
+        """列出所有文件"""
+        return list(self.files.values())
+    
+    def get_session_for_file(self, openai_file_id: str) -> Optional[str]:
+        """获取文件关联的会话名称"""
+        file_info = self.files.get(openai_file_id)
+        return file_info.get("session_name") if file_info else None
+
+
+# 全局文件管理器
+file_manager = FileManager()
 
 
 def check_proxy(proxy: str) -> bool:
@@ -239,23 +294,37 @@ def get_headers(jwt: str) -> dict:
 
 def ensure_jwt_for_account(account_idx: int, account: dict):
     """确保指定账号的JWT有效，必要时刷新"""
+    print(f"[DEBUG][ensure_jwt_for_account] 开始 - 账号索引: {account_idx}, CSESIDX: {account.get('csesidx')}")
+    start_time = time.time()
     with account_manager.lock:
         state = account_manager.account_states[account_idx]
-        if state["jwt"] is None or time.time() - state["jwt_time"] > 240:
+        jwt_age = time.time() - state["jwt_time"] if state["jwt"] else float('inf')
+        print(f"[DEBUG][ensure_jwt_for_account] JWT状态 - 存在: {state['jwt'] is not None}, 年龄: {jwt_age:.2f}秒")
+        if state["jwt"] is None or jwt_age > 240:
+            print(f"[DEBUG][ensure_jwt_for_account] 需要刷新JWT...")
             proxy = account_manager.config.get("proxy")
             try:
+                refresh_start = time.time()
                 state["jwt"] = get_jwt_for_account(account, proxy)
                 state["jwt_time"] = time.time()
+                print(f"[DEBUG][ensure_jwt_for_account] JWT刷新成功 - 耗时: {time.time() - refresh_start:.2f}秒")
             except Exception as e:
+                print(f"[DEBUG][ensure_jwt_for_account] JWT刷新失败: {e}")
                 # JWT获取失败，标记账号不可用
                 account_manager.mark_account_unavailable(account_idx, str(e))
                 raise
+        else:
+            print(f"[DEBUG][ensure_jwt_for_account] 使用缓存JWT")
+        print(f"[DEBUG][ensure_jwt_for_account] 完成 - 总耗时: {time.time() - start_time:.2f}秒")
         return state["jwt"]
 
 
 def create_chat_session(jwt: str, team_id: str, proxy: str) -> str:
     """创建会话，返回session ID"""
+    print(f"[DEBUG][create_chat_session] 开始 - team_id: {team_id}")
+    start_time = time.time()
     session_id = uuid.uuid4().hex[:12]
+    print(f"[DEBUG][create_chat_session] 生成session_id: {session_id}")
     body = {
         "configId": team_id,
         "additionalParams": {"token": "-"},
@@ -265,6 +334,10 @@ def create_chat_session(jwt: str, team_id: str, proxy: str) -> str:
     }
 
     proxies = {"http": proxy, "https": proxy} if proxy else None
+    print(f"[DEBUG][create_chat_session] 发送请求到: {CREATE_SESSION_URL}")
+    print(f"[DEBUG][create_chat_session] 使用代理: {proxy}")
+    
+    request_start = time.time()
     resp = requests.post(
         CREATE_SESSION_URL,
         headers=get_headers(jwt),
@@ -273,26 +346,114 @@ def create_chat_session(jwt: str, team_id: str, proxy: str) -> str:
         verify=False,
         timeout=30
     )
+    print(f"[DEBUG][create_chat_session] 请求完成 - 状态码: {resp.status_code}, 耗时: {time.time() - request_start:.2f}秒")
 
     if resp.status_code != 200:
+        print(f"[DEBUG][create_chat_session] 请求失败 - 响应: {resp.text[:500]}")
         if resp.status_code == 401:
-            print(f"账号: {account.get('csesidx')} 一般情况下都是team_id填错了～")
+            print(f"[DEBUG][create_chat_session] 401错误 - 可能是team_id填错了")
         raise Exception(f"创建会话失败: {resp.status_code}")
 
     data = resp.json()
-    return data.get("session", {}).get("name")
+    session_name = data.get("session", {}).get("name")
+    print(f"[DEBUG][create_chat_session] 完成 - session_name: {session_name}, 总耗时: {time.time() - start_time:.2f}秒")
+    return session_name
 
 
 def ensure_session_for_account(account_idx: int, account: dict):
     """确保指定账号的会话有效"""
+    print(f"[DEBUG][ensure_session_for_account] 开始 - 账号索引: {account_idx}")
+    start_time = time.time()
+    
+    jwt_start = time.time()
     jwt = ensure_jwt_for_account(account_idx, account)
+    print(f"[DEBUG][ensure_session_for_account] JWT获取完成 - 耗时: {time.time() - jwt_start:.2f}秒")
+    
     with account_manager.lock:
         state = account_manager.account_states[account_idx]
+        print(f"[DEBUG][ensure_session_for_account] 当前session状态: {state['session'] is not None}")
         if state["session"] is None:
+            print(f"[DEBUG][ensure_session_for_account] 需要创建新session...")
             proxy = account_manager.config.get("proxy")
             team_id = account.get("team_id")
+            session_start = time.time()
             state["session"] = create_chat_session(jwt, team_id, proxy)
+            print(f"[DEBUG][ensure_session_for_account] Session创建完成 - 耗时: {time.time() - session_start:.2f}秒")
+        else:
+            print(f"[DEBUG][ensure_session_for_account] 使用缓存session: {state['session']}")
+        
+        print(f"[DEBUG][ensure_session_for_account] 完成 - 总耗时: {time.time() - start_time:.2f}秒")
         return state["session"], jwt, account.get("team_id")
+
+
+# ==================== 文件上传功能 ====================
+
+def upload_file_to_gemini(jwt: str, session_name: str, team_id: str, 
+                          file_content: bytes, filename: str, mime_type: str,
+                          proxy: str = None) -> str:
+    """
+    上传文件到 Gemini，返回 Gemini 的 fileId
+    
+    Args:
+        jwt: JWT 认证令牌
+        session_name: 会话名称
+        team_id: 团队ID
+        file_content: 文件内容（字节）
+        filename: 文件名
+        mime_type: MIME 类型
+        proxy: 代理地址
+    
+    Returns:
+        str: Gemini 返回的 fileId
+    """
+    start_time = time.time()
+    print(f"[DEBUG][upload_file_to_gemini] 开始上传文件: {filename}, MIME类型: {mime_type}, 文件大小: {len(file_content)} bytes")
+    
+    encode_start = time.time()
+    file_contents_b64 = base64.b64encode(file_content).decode('utf-8')
+    print(f"[DEBUG][upload_file_to_gemini] Base64编码完成 - 耗时: {time.time() - encode_start:.2f}秒, 编码后大小: {len(file_contents_b64)} chars")
+    
+    body = {
+        "addContextFileRequest": {
+            "fileContents": file_contents_b64,
+            "fileName": filename,
+            "mimeType": mime_type,
+            "name": session_name
+        },
+        "additionalParams": {"token": "-"},
+        "configId": team_id
+    }
+    
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    print(f"[DEBUG][upload_file_to_gemini] 准备发送请求到: {ADD_CONTEXT_FILE_URL}")
+    print(f"[DEBUG][upload_file_to_gemini] 使用代理: {proxy if proxy else '无'}")
+    
+    request_start = time.time()
+    resp = requests.post(
+        ADD_CONTEXT_FILE_URL,
+        headers=get_headers(jwt),
+        json=body,
+        proxies=proxies,
+        verify=False,
+        timeout=60
+    )
+    print(f"[DEBUG][upload_file_to_gemini] 请求完成 - 耗时: {time.time() - request_start:.2f}秒, 状态码: {resp.status_code}")
+    
+    if resp.status_code != 200:
+        print(f"[DEBUG][upload_file_to_gemini] 上传失败 - 响应内容: {resp.text[:500]}")
+        raise Exception(f"文件上传失败: {resp.status_code} - {resp.text}")
+    
+    parse_start = time.time()
+    data = resp.json()
+    file_id = data.get("addContextFileResponse", {}).get("fileId")
+    print(f"[DEBUG][upload_file_to_gemini] 解析响应完成 - 耗时: {time.time() - parse_start:.2f}秒")
+    
+    if not file_id:
+        print(f"[DEBUG][upload_file_to_gemini] 响应中未找到fileId - 响应数据: {data}")
+        raise ValueError(f"响应中未找到 fileId: {data}")
+    
+    print(f"[DEBUG][upload_file_to_gemini] 上传成功 - fileId: {file_id}, 总耗时: {time.time() - start_time:.2f}秒")
+    return file_id
 
 
 # ==================== 图片处理功能 ====================
@@ -498,8 +659,8 @@ def download_file_with_jwt(jwt: str, session_name: str, file_id: str, proxy: Opt
 
 
 def stream_chat_with_images(jwt: str, sess_name: str, message: str, images: List[Dict], 
-                            proxy: str, team_id: str) -> ChatResponse:
-    """发送消息并流式接收响应，支持图片输入输出
+                            proxy: str, team_id: str, file_ids: List[str] = None) -> ChatResponse:
+    """发送消息并流式接收响应，支持图片输入输出和文件附件
     
     Args:
         jwt: JWT token
@@ -508,6 +669,7 @@ def stream_chat_with_images(jwt: str, sess_name: str, message: str, images: List
         images: 图片列表 [{type: 'base64'|'url', ...}]
         proxy: 代理地址
         team_id: 团队ID
+        file_ids: Gemini 文件ID列表（用于附带已上传的文件）
     
     Returns:
         ChatResponse 包含文本和图片
@@ -537,6 +699,9 @@ def stream_chat_with_images(jwt: str, sess_name: str, message: str, images: List
             except Exception as e:
                 print(f"[图片] 下载输入图片失败: {e}")
     
+    # 准备请求中的文件ID列表
+    request_file_ids = file_ids if file_ids else []
+    
     body = {
         "configId": team_id,
         "additionalParams": {"token": "-"},
@@ -544,7 +709,7 @@ def stream_chat_with_images(jwt: str, sess_name: str, message: str, images: List
             "session": sess_name,
             "query": {"parts": query_parts},
             "filter": "",
-            "fileIds": [],
+            "fileIds": request_file_ids,
             "answerGenerationMode": "NORMAL",
             "toolsSpec": {
                 "webGroundingSpec": {},
@@ -783,6 +948,172 @@ def list_models():
     return jsonify({"object": "list", "data": models_data})
 
 
+@app.route('/v1/files', methods=['POST'])
+def upload_file():
+    """OpenAI 兼容的文件上传接口"""
+    import traceback
+    request_start_time = time.time()
+    print(f"\n{'='*60}")
+    print(f"[文件上传] ===== 接口调用开始 =====")
+    print(f"[文件上传] 请求时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    try:
+        # 检查是否有文件
+        step_start = time.time()
+        print(f"[文件上传] 步骤1: 检查请求中的文件...")
+        if 'file' not in request.files:
+            print(f"[文件上传] 错误: 请求中没有文件")
+            return jsonify({"error": {"message": "No file provided", "type": "invalid_request_error"}}), 400
+        
+        file = request.files['file']
+        if file.filename == '':
+            print(f"[文件上传] 错误: 文件名为空")
+            return jsonify({"error": {"message": "No file selected", "type": "invalid_request_error"}}), 400
+        print(f"[文件上传] 步骤1完成: 文件名={file.filename}, 耗时={time.time()-step_start:.3f}秒")
+        
+        # 获取文件内容和MIME类型
+        step_start = time.time()
+        print(f"[文件上传] 步骤2: 读取文件内容...")
+        file_content = file.read()
+        mime_type = file.content_type or mimetypes.guess_type(file.filename)[0] or 'application/octet-stream'
+        print(f"[文件上传] 步骤2完成: 文件大小={len(file_content)}字节, MIME类型={mime_type}, 耗时={time.time()-step_start:.3f}秒")
+        
+        # 获取账号信息
+        max_retries = len(account_manager.accounts)
+        last_error = None
+        gemini_file_id = None
+        print(f"[文件上传] 步骤3: 开始尝试上传, 最大重试次数={max_retries}")
+        
+        for retry_idx in range(max_retries):
+            retry_start = time.time()
+            print(f"\n[文件上传] --- 第{retry_idx+1}次尝试 ---")
+            try:
+                # 获取账号
+                step_start = time.time()
+                print(f"[文件上传] 步骤3.{retry_idx+1}.1: 获取下一个可用账号...")
+                account_idx, account = account_manager.get_next_account()
+                print(f"[文件上传] 步骤3.{retry_idx+1}.1完成: 账号索引={account_idx}, CSESIDX={account.get('csesidx')}, 耗时={time.time()-step_start:.3f}秒")
+                
+                # 确保会话有效
+                step_start = time.time()
+                print(f"[文件上传] 步骤3.{retry_idx+1}.2: 确保会话有效(JWT+Session)...")
+                session, jwt, team_id = ensure_session_for_account(account_idx, account)
+                print(f"[文件上传] 步骤3.{retry_idx+1}.2完成: session={session}, team_id={team_id}, 耗时={time.time()-step_start:.3f}秒")
+                
+                proxy = account_manager.config.get("proxy")
+                print(f"[文件上传] 代理设置: {proxy}")
+                
+                # 上传文件到 Gemini
+                step_start = time.time()
+                print(f"[文件上传] 步骤3.{retry_idx+1}.3: 上传文件到Gemini...")
+                gemini_file_id = upload_file_to_gemini(jwt, session, team_id, file_content, file.filename, mime_type, proxy)
+                print(f"[文件上传] 步骤3.{retry_idx+1}.3完成: gemini_file_id={gemini_file_id}, 耗时={time.time()-step_start:.3f}秒")
+                
+                if gemini_file_id:
+                    # 生成 OpenAI 格式的 file_id
+                    step_start = time.time()
+                    print(f"[文件上传] 步骤4: 生成OpenAI格式响应...")
+                    openai_file_id = f"file-{uuid.uuid4().hex[:24]}"
+                    
+                    # 保存映射关系
+                    file_manager.add_file(
+                        openai_file_id=openai_file_id,
+                        gemini_file_id=gemini_file_id,
+                        session_name=session,
+                        filename=file.filename,
+                        mime_type=mime_type,
+                        size=len(file_content)
+                    )
+                    print(f"[文件上传] 步骤4完成: openai_file_id={openai_file_id}, 耗时={time.time()-step_start:.3f}秒")
+                    
+                    total_time = time.time() - request_start_time
+                    print(f"\n[文件上传] ===== 上传成功 =====")
+                    print(f"[文件上传] 总耗时: {total_time:.3f}秒")
+                    print(f"{'='*60}\n")
+                    
+                    # 返回 OpenAI 格式响应
+                    return jsonify({
+                        "id": openai_file_id,
+                        "object": "file",
+                        "bytes": len(file_content),
+                        "created_at": int(time.time()),
+                        "filename": file.filename,
+                        "purpose": request.form.get('purpose', 'assistants')
+                    })
+                else:
+                    print(f"[文件上传] 警告: gemini_file_id为空")
+                    
+            except Exception as e:
+                last_error = e
+                print(f"[文件上传] 第{retry_idx+1}次尝试失败: {type(e).__name__}: {e}")
+                print(f"[文件上传] 堆栈跟踪:\n{traceback.format_exc()}")
+                print(f"[文件上传] 本次尝试耗时: {time.time()-retry_start:.3f}秒")
+                continue
+        
+        total_time = time.time() - request_start_time
+        print(f"\n[文件上传] ===== 所有重试均失败 =====")
+        print(f"[文件上传] 最后错误: {last_error}")
+        print(f"[文件上传] 总耗时: {total_time:.3f}秒")
+        print(f"{'='*60}\n")
+        return jsonify({"error": {"message": f"文件上传失败: {last_error}", "type": "api_error"}}), 500
+        
+    except Exception as e:
+        total_time = time.time() - request_start_time
+        print(f"\n[文件上传] ===== 发生异常 =====")
+        print(f"[文件上传] 错误类型: {type(e).__name__}")
+        print(f"[文件上传] 错误信息: {e}")
+        print(f"[文件上传] 堆栈跟踪:\n{traceback.format_exc()}")
+        print(f"[文件上传] 总耗时: {total_time:.3f}秒")
+        print(f"{'='*60}\n")
+        return jsonify({"error": {"message": str(e), "type": "api_error"}}), 500
+
+
+@app.route('/v1/files', methods=['GET'])
+def list_files():
+    """获取已上传文件列表"""
+    files = file_manager.list_files()
+    return jsonify({
+        "object": "list",
+        "data": [{
+            "id": f["openai_file_id"],
+            "object": "file",
+            "bytes": f.get("size", 0),
+            "created_at": f.get("created_at", int(time.time())),
+            "filename": f.get("filename", ""),
+            "purpose": "assistants"
+        } for f in files]
+    })
+
+
+@app.route('/v1/files/<file_id>', methods=['GET'])
+def get_file(file_id):
+    """获取文件信息"""
+    file_info = file_manager.get_file(file_id)
+    if not file_info:
+        return jsonify({"error": {"message": "File not found", "type": "invalid_request_error"}}), 404
+    
+    return jsonify({
+        "id": file_info["openai_file_id"],
+        "object": "file",
+        "bytes": file_info.get("size", 0),
+        "created_at": file_info.get("created_at", int(time.time())),
+        "filename": file_info.get("filename", ""),
+        "purpose": "assistants"
+    })
+
+
+@app.route('/v1/files/<file_id>', methods=['DELETE'])
+def delete_file(file_id):
+    """删除文件"""
+    if file_manager.delete_file(file_id):
+        return jsonify({
+            "id": file_id,
+            "object": "file",
+            "deleted": True
+        })
+    return jsonify({"error": {"message": "File not found", "type": "invalid_request_error"}}), 404
+
+
 @app.route('/v1/chat/completions', methods=['POST'])
 def chat_completions():
     """聊天对话接口（支持图片输入输出）"""
@@ -794,9 +1125,10 @@ def chat_completions():
         messages = data.get('messages', [])
         stream = data.get('stream', False)
 
-        # 提取用户消息和图片
+        # 提取用户消息、图片和文件ID
         user_message = ""
         input_images = []
+        input_file_ids = []  # OpenAI file_id 列表
         
         for msg in messages:
             if msg.get('role') == 'user':
@@ -805,8 +1137,35 @@ def chat_completions():
                 if text:
                     user_message = text
                 input_images.extend(images)
-
-        if not user_message and not input_images:
+                
+                # 提取文件ID（支持多种格式）
+                if isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict):
+                            print(f"[调试] 发现文件项: {item}")
+                            # 格式1: {"type": "file", "file_id": "xxx"}
+                            if item.get('type') == 'file' and item.get('file_id'):
+                                input_file_ids.append(item['file_id'])
+                            # 格式2: {"type": "file", "file": {"file_id": "xxx"}}
+                            elif item.get('type') == 'file' and isinstance(item.get('file'), dict):
+                                file_obj = item['file']
+                                # 支持 file_id 或 id 两种字段名
+                                fid = file_obj.get('file_id') or file_obj.get('id')
+                                if fid:
+                                    input_file_ids.append(fid)
+        
+        # 将 OpenAI file_id 转换为 Gemini fileId
+        gemini_file_ids = []
+        print(f"[调试] 输入的OpenAI文件ID: {input_file_ids}")
+        for fid in input_file_ids:
+            gemini_fid = file_manager.get_gemini_file_id(fid)
+            if gemini_fid:
+                gemini_file_ids.append(gemini_fid)
+            else:
+                print(f"[警告] 未找到文件映射: {fid}")
+        print(f"[调试] 转换后的Gemini文件ID: {gemini_file_ids}")
+        
+        if not user_message and not input_images and not gemini_file_ids:
             return jsonify({"error": "No user message found"}), 400
         
         # 轮训获取账号
@@ -822,8 +1181,8 @@ def chat_completions():
                 session, jwt, team_id = ensure_session_for_account(account_idx, account)
                 proxy = account_manager.config.get("proxy")
                 
-                # 发送请求（支持图片）
-                chat_response = stream_chat_with_images(jwt, session, user_message, input_images, proxy, team_id)
+                # 发送请求（支持图片和文件）
+                chat_response = stream_chat_with_images(jwt, session, user_message, input_images, proxy, team_id, gemini_file_ids)
                 break
             except Exception as e:
                 last_error = e
